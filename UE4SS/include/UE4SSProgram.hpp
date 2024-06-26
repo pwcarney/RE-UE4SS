@@ -23,7 +23,13 @@
 
 // Used to set up ImGui context and allocator in DLL mods
 #define UE4SS_ENABLE_IMGUI()                                                                                                                                   \
+    /* Wait for UE4SS to create the imgui context. */                                                                                                          \
+    /* Without this, we're setting the context to nullptr and eventually crashing when we use any imgui functions. */                                          \
     {                                                                                                                                                          \
+        while ((UE4SSProgram::settings_manager.Debug.DebugConsoleVisible || UE4SSProgram::get_program().m_render_thread.get_id() != std::jthread::id{}) &&     \
+               !UE4SSProgram::get_program().get_current_imgui_context())                                                                                       \
+        {                                                                                                                                                      \
+        }                                                                                                                                                      \
         ImGui::SetCurrentContext(UE4SSProgram::get_current_imgui_context());                                                                                   \
         ImGuiMemAllocFunc alloc_func{};                                                                                                                        \
         ImGuiMemFreeFunc free_func{};                                                                                                                          \
@@ -62,8 +68,21 @@ namespace RC
         uint64_t safety_padding[8]{0};
     };
 
+    struct KeyDownEventData
+    {
+        // Custom data from the C++ mod.
+        // The 'custom_data' variable to UE4SSProgram::register_keydown_event will be used to determine the type of custom_data2.
+        uint8_t custom_data{};
+
+        // The C++ mod that created this event.
+        CppUserModBase* mod{};
+    };
+
     class UE4SSProgram : public MProgram
     {
+      public:
+        friend class CppUserModBase; // m_input_handler
+
       public:
         constexpr static wchar_t m_settings_file_name[] = L"UE4SS-settings.ini";
         constexpr static wchar_t m_log_file_name[] = L"UE4SS.log";
@@ -79,6 +98,8 @@ namespace RC
       protected:
         Input::Handler m_input_handler{L"ConsoleWindowClass", L"UnrealWindow"};
         std::jthread m_event_loop;
+
+      public:
         std::jthread m_render_thread;
 
       private:
@@ -95,6 +116,7 @@ namespace RC
         std::filesystem::path m_object_dumper_output_directory;
         std::filesystem::path m_default_settings_path_and_file;
         std::filesystem::path m_settings_path_and_file;
+        std::filesystem::path m_legacy_root_directory;
         Output::DebugConsoleDevice* m_debug_console_device{};
         Output::ConsoleDevice* m_console_device{};
         GUI::DebuggingGUI m_debugging_gui{};
@@ -170,11 +192,17 @@ namespace RC
       protected:
         auto update() -> void;
         auto setup_cpp_mods() -> void;
-        auto start_cpp_mods() -> void;
+        enum class IsInitialStartup
+        {
+            Yes,
+            No
+        };
+        auto start_cpp_mods(IsInitialStartup = IsInitialStartup::No) -> void;
         auto setup_mods() -> void;
         auto start_lua_mods() -> void;
         auto uninstall_mods() -> void;
         auto fire_unreal_init_for_cpp_mods() -> void;
+        auto fire_ui_init_for_cpp_mods() -> void;
         auto fire_program_start_for_cpp_mods() -> void;
         auto fire_dll_load_for_cpp_mods(std::wstring_view dll_name) -> void;
 
@@ -184,8 +212,10 @@ namespace RC
         auto reinstall_mods() -> void;
         auto get_object_dumper_output_directory() -> const File::StringType;
         RC_UE4SS_API auto get_module_directory() -> File::StringViewType;
+        RC_UE4SS_API auto get_game_executable_directory() -> File::StringViewType;
         RC_UE4SS_API auto get_working_directory() -> File::StringViewType;
         RC_UE4SS_API auto get_mods_directory() -> File::StringViewType;
+        RC_UE4SS_API auto get_legacy_root_directory() -> File::StringViewType;
         RC_UE4SS_API auto generate_uht_compatible_headers() -> void;
         RC_UE4SS_API auto generate_cxx_headers(const std::filesystem::path& output_dir) -> void;
         RC_UE4SS_API auto generate_lua_types(const std::filesystem::path& output_dir) -> void;
@@ -213,9 +243,12 @@ namespace RC
 
       public:
         // API pass-through for use outside the private scope of UE4SSProgram
-        RC_UE4SS_API auto register_keydown_event(Input::Key, const Input::EventCallbackCallable&, uint8_t custom_data = 0) -> void;
-        RC_UE4SS_API auto register_keydown_event(Input::Key, const Input::Handler::ModifierKeyArray&, const Input::EventCallbackCallable&, uint8_t custom_data = 0)
-                -> void;
+        RC_UE4SS_API auto register_keydown_event(Input::Key, const Input::EventCallbackCallable&, uint8_t custom_data = 0, void* custom_data2 = nullptr) -> void;
+        RC_UE4SS_API auto register_keydown_event(Input::Key,
+                                                 const Input::Handler::ModifierKeyArray&,
+                                                 const Input::EventCallbackCallable&,
+                                                 uint8_t custom_data = 0,
+                                                 void* custom_data2 = nullptr) -> void;
         RC_UE4SS_API auto is_keydown_event_registered(Input::Key) -> bool;
         RC_UE4SS_API auto is_keydown_event_registered(Input::Key, const Input::Handler::ModifierKeyArray&) -> bool;
 

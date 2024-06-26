@@ -6,6 +6,7 @@
 #include <Common.hpp>
 #include <File/Macros.hpp>
 #include <GUI/GUITab.hpp>
+#include <Input/Handler.hpp>
 
 namespace RC
 {
@@ -49,6 +50,12 @@ namespace RC
         // The 'Unreal' module has been initialized.
         // Before this fires, you cannot use anything in the 'Unreal' namespace.
         RC_UE4SS_API virtual auto on_unreal_init() -> void
+        {
+        }
+
+        // The UI module has been initialized.
+        // This is where you need to use the 'UE4SS_ENABLE_IMGUI' macro if you want to utilize the imgui context of UE4SS.
+        RC_UE4SS_API virtual auto on_ui_init() -> void
         {
         }
 
@@ -126,5 +133,8 @@ namespace RC
 
       protected:
         RC_UE4SS_API auto register_tab(std::wstring_view tab_name, GUI::GUITab::RenderFunctionType) -> void;
+        RC_UE4SS_API auto register_keydown_event(Input::Key, const Input::EventCallbackCallable&, uint8_t custom_data = 0) -> void;
+        RC_UE4SS_API auto register_keydown_event(Input::Key, const Input::Handler::ModifierKeyArray&, const Input::EventCallbackCallable&, uint8_t custom_data = 0)
+                -> void;
     };
 } // namespace RC

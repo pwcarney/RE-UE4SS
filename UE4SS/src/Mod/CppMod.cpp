@@ -22,7 +22,7 @@ namespace RC
         auto dll_path = m_dlls_path + L"\\main.dll";
         // Add mods dlls directory to search path for dynamic/shared linked libraries in mods
         m_dlls_path_cookie = AddDllDirectory(m_dlls_path.c_str());
-        m_main_dll_module = LoadLibraryW(dll_path.c_str());
+        m_main_dll_module = LoadLibraryExW(dll_path.c_str(), NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 
         if (!m_main_dll_module)
         {
@@ -125,6 +125,14 @@ namespace RC
         if (m_mod)
         {
             m_mod->on_unreal_init();
+        }
+    }
+
+    auto CppMod::fire_ui_init() -> void
+    {
+        if (m_mod)
+        {
+            m_mod->on_ui_init();
         }
     }
 

@@ -25,10 +25,8 @@ namespace RC
         UE4SSProgram& m_program;
 
       protected:
-#pragma warning(disable : 4251)
         std::wstring m_mod_name;
         std::wstring m_mod_path;
-#pragma warning(default : 4251)
 
       protected:
         // Whether the mod can be installed
@@ -65,6 +63,8 @@ namespace RC
         virtual auto fire_update() -> void;
 
         virtual auto fire_unreal_init() -> void{};
+
+        virtual auto fire_ui_init() -> void{};
 
         // Called once when the program is starting, after mods are setup but before any mods have been started
         virtual auto fire_program_start() -> void{};

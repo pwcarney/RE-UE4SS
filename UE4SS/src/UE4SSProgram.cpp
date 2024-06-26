@@ -12,7 +12,7 @@
 #include <fstream>
 #include <limits>
 #include <unordered_set>
-
+#include <fmt/chrono.h>
 #include <Profiler/Profiler.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <ExceptionHandling.hpp>
@@ -54,6 +54,8 @@
 #include <Unreal/UnrealInitializer.hpp>
 #include <Unreal/World.hpp>
 #include <UnrealDef.hpp>
+
+#include <polyhook2/PE/IatHook.hpp>
 
 namespace RC
 {
@@ -174,7 +176,7 @@ namespace RC
             }
             catch (std::exception& e)
             {
-                create_emergency_console_for_early_error(std::format(STR("The IniParser failed to parse: {}"), to_wstring(e.what())));
+                create_emergency_console_for_early_error(fmt::format(STR("The IniParser failed to parse: {}"), to_wstring(e.what())));
                 return;
             }
 
@@ -197,7 +199,7 @@ namespace RC
             {
                 m_console_device = &Output::set_default_devices<Output::ConsoleDevice>();
                 m_console_device->set_formatter([](File::StringViewType string) -> File::StringType {
-                    return std::format(STR("[{}] {}"), std::format(STR("{:%X}"), std::chrono::system_clock::now()), string);
+                    return fmt::format(STR("[{}] {}"), fmt::format(STR("{:%X}"), std::chrono::system_clock::now()), string);
                 });
                 if (settings_manager.Debug.DebugConsoleVisible)
                 {
@@ -219,9 +221,9 @@ namespace RC
                          UE4SS_LIB_VERSION_MAJOR,
                          UE4SS_LIB_VERSION_MINOR,
                          UE4SS_LIB_VERSION_HOTFIX,
-                         std::format(L"{}", UE4SS_LIB_VERSION_PRERELEASE == 0 ? L"" : std::format(L" PreRelease #{}", UE4SS_LIB_VERSION_PRERELEASE)),
-                         std::format(L"{}",
-                                     UE4SS_LIB_BETA_STARTED == 0 ? L"" : (UE4SS_LIB_IS_BETA == 0 ? L" Beta #?" : std::format(L" Beta #{}", UE4SS_LIB_VERSION_BETA))),
+                         fmt::format(L"{}", UE4SS_LIB_VERSION_PRERELEASE == 0 ? L"" : fmt::format(L" PreRelease #{}", UE4SS_LIB_VERSION_PRERELEASE)),
+                         fmt::format(L"{}",
+                                     UE4SS_LIB_BETA_STARTED == 0 ? L"" : (UE4SS_LIB_IS_BETA == 0 ? L" Beta #?" : fmt::format(L" Beta #{}", UE4SS_LIB_VERSION_BETA))),
                          to_wstring(UE4SS_LIB_BUILD_GITSHA));
 
 #ifdef __clang__
@@ -264,7 +266,7 @@ namespace RC
 
             setup_mods();
             install_cpp_mods();
-            start_cpp_mods();
+            start_cpp_mods(IsInitialStartup::Yes);
 
             setup_mod_directory_path();
 
@@ -377,23 +379,20 @@ namespace RC
         // At that point, the working directory will be "root/<GameName>"
         m_working_directory = m_root_directory;
 
-        // Default file to open if there is no game specific config
-        m_default_settings_path_and_file = m_root_directory / m_settings_file_name;
-
         wchar_t exe_path_buffer[1024];
         GetModuleFileNameW(GetModuleHandle(nullptr), exe_path_buffer, 1023);
         std::filesystem::path game_exe_path = exe_path_buffer;
         std::filesystem::path game_directory_path = game_exe_path.parent_path();
+        m_legacy_root_directory = game_directory_path;
+
         m_working_directory = m_root_directory;
         m_mods_directory = m_working_directory / "Mods";
-        m_game_executable_directory = game_directory_path /*game_exe_path.parent_path()*/;
+        m_game_executable_directory = game_directory_path;
         m_settings_path_and_file = m_root_directory;
         m_game_path_and_exe_name = game_exe_path;
-        m_object_dumper_output_directory = m_game_executable_directory;
+        m_object_dumper_output_directory = m_working_directory;
 
-        // Allow loading of DLLs from mod folders
-        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        // Make sure game directory DLLs are also included
+        // Allow loading of DLLs from the game directory
         AddDllDirectory(game_exe_path.c_str());
 
         for (const auto& item : std::filesystem::directory_iterator(m_root_directory))
@@ -411,12 +410,23 @@ namespace RC
                 m_settings_path_and_file = std::move(item.path());
                 m_log_directory = m_working_directory;
                 m_object_dumper_output_directory = m_working_directory;
+                m_legacy_root_directory = m_legacy_root_directory / item.path();
                 break;
             }
         }
 
         m_log_directory = m_working_directory;
         m_settings_path_and_file.append(m_settings_file_name);
+
+        // Check for legacy locations and update paths accordingly
+        if (std::filesystem::exists(m_legacy_root_directory / m_settings_file_name) && !std::filesystem::exists(m_settings_path_and_file))
+        {
+            m_settings_path_and_file = m_legacy_root_directory / m_settings_file_name;
+        }
+        if (std::filesystem::exists(m_legacy_root_directory / "Mods") && !std::filesystem::exists(m_mods_directory))
+        {
+            m_mods_directory = m_legacy_root_directory / "Mods";
+        }
     }
 
     auto UE4SSProgram::create_emergency_console_for_early_error(File::StringViewType error_message) -> void
@@ -447,7 +457,7 @@ namespace RC
             m_debug_console_device = &Output::set_default_devices<Output::DebugConsoleDevice>();
             Output::set_default_log_level<LogLevel::Normal>();
             m_debug_console_device->set_formatter([](File::StringViewType string) -> File::StringType {
-                return std::format(STR("[{}] {}"), std::format(STR("{:%X}"), std::chrono::system_clock::now()), string);
+                return fmt::format(STR("[{}] {}"), fmt::format(STR("{:%X}"), std::chrono::system_clock::now()), string);
             });
 
             if (AllocConsole())
@@ -795,7 +805,6 @@ namespace RC
             if (settings_manager.General.UseUObjectArrayCache)
             {
                 m_debugging_gui.get_live_view().set_listeners_allowed(true);
-                m_debugging_gui.get_live_view().set_listeners();
             }
             else
             {
@@ -809,6 +818,7 @@ namespace RC
                     if (!was_gui_open)
                     {
                         m_render_thread = std::jthread{&GUI::gui_thread, &m_debugging_gui};
+                        fire_ui_init_for_cpp_mods();
                     }
                 });
             });
@@ -1070,6 +1080,19 @@ namespace RC
         }
     }
 
+    auto UE4SSProgram::fire_ui_init_for_cpp_mods() -> void
+    {
+        ProfilerScope();
+        for (const auto& mod : m_mods)
+        {
+            if (!dynamic_cast<CppMod*>(mod.get()))
+            {
+                continue;
+            }
+            mod->fire_ui_init();
+        }
+    }
+
     auto UE4SSProgram::fire_program_start_for_cpp_mods() -> void
     {
         ProfilerScope();
@@ -1166,7 +1189,7 @@ namespace RC
             }
             if (ec.value() != 0)
             {
-                return std::format("is_directory ran into error {}", ec.value());
+                return fmt::format("is_directory ran into error {}", ec.value());
             }
 
             if (!std::filesystem::exists(mod_directory.path() / "enabled.txt", ec))
@@ -1175,7 +1198,7 @@ namespace RC
             }
             if (ec.value() != 0)
             {
-                return std::format("exists ran into error {}", ec.value());
+                return fmt::format("exists ran into error {}", ec.value());
             }
 
             auto mod = UE4SSProgram::find_mod_by_name<ModType>(mod_directory.path().stem().c_str(), UE4SSProgram::IsInstalled::Yes);
@@ -1211,13 +1234,21 @@ namespace RC
         }
     }
 
-    auto UE4SSProgram::start_cpp_mods() -> void
+    auto UE4SSProgram::start_cpp_mods(IsInitialStartup is_initial_startup) -> void
     {
         ProfilerScope();
         auto error_message = start_mods<CppMod>();
         if (!error_message.empty())
         {
             set_error(error_message.c_str());
+        }
+        // If this is the initial startup, notify mods that the UI has initialized.
+        // This isn't completely accurate since the UI will usually have started a while ago.
+        // However, we can't immediately notify mods of this because no mods have been started at that point.
+        // We only need to do this for the initial start of UE4SS because after that, more accurate notifications will happen when the UI is closed an reopened.
+        if (is_initial_startup == IsInitialStartup::Yes && m_render_thread.get_id() != std::this_thread::get_id())
+        {
+            fire_ui_init_for_cpp_mods();
         }
     }
 
@@ -1275,6 +1306,8 @@ namespace RC
             for (auto& [key, vector_of_key_data] : input_event.key_data)
             {
                 std::erase_if(vector_of_key_data, [&](Input::KeyData& key_data) -> bool {
+                    // custom_data == 1: Bind came from Lua, and custom_data2 is nullptr.
+                    // custom_data == 2: Bind came from C++, and custom_data2 is a pointer to KeyDownEventData. Must free it.
                     if (key_data.custom_data == 1)
                     {
                         return true;
@@ -1323,6 +1356,11 @@ namespace RC
         return m_module_file_path.c_str();
     }
 
+    auto UE4SSProgram::get_game_executable_directory() -> File::StringViewType
+    {
+        return m_game_executable_directory.c_str();
+    }
+
     auto UE4SSProgram::get_working_directory() -> File::StringViewType
     {
         return m_working_directory.c_str();
@@ -1331,6 +1369,11 @@ namespace RC
     auto UE4SSProgram::get_mods_directory() -> File::StringViewType
     {
         return m_mods_directory.c_str();
+    }
+
+    auto UE4SSProgram::get_legacy_root_directory() -> File::StringViewType
+    {
+        return m_legacy_root_directory.c_str();
     }
 
     auto UE4SSProgram::generate_uht_compatible_headers() -> void
@@ -1445,17 +1488,18 @@ namespace RC
         return m_queued_events.empty();
     }
 
-    auto UE4SSProgram::register_keydown_event(Input::Key key, const Input::EventCallbackCallable& callback, uint8_t custom_data) -> void
+    auto UE4SSProgram::register_keydown_event(Input::Key key, const Input::EventCallbackCallable& callback, uint8_t custom_data, void* custom_data2) -> void
     {
-        m_input_handler.register_keydown_event(key, callback, custom_data);
+        m_input_handler.register_keydown_event(key, callback, custom_data, custom_data2);
     }
 
     auto UE4SSProgram::register_keydown_event(Input::Key key,
                                               const Input::Handler::ModifierKeyArray& modifier_keys,
                                               const Input::EventCallbackCallable& callback,
-                                              uint8_t custom_data) -> void
+                                              uint8_t custom_data,
+                                              void* custom_data2) -> void
     {
-        m_input_handler.register_keydown_event(key, modifier_keys, callback, custom_data);
+        m_input_handler.register_keydown_event(key, modifier_keys, callback, custom_data, custom_data2);
     }
 
     auto UE4SSProgram::is_keydown_event_registered(Input::Key key) -> bool

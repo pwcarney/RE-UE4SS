@@ -15,7 +15,7 @@
 #include <GUI/ImGuiUtility.hpp>
 #include <GUI/LiveView.hpp>
 #include <GUI/LiveView/Filter/DefaultObjectsOnly.hpp>
-#include <GUI/LiveView/Filter/ExcludeClassName.hpp>
+#include "GUI/LiveView/Filter/ClassNamesFilter.hpp"
 #include <GUI/LiveView/Filter/FunctionParamFlags.hpp>
 #include <GUI/LiveView/Filter/HasProperty.hpp>
 #include <GUI/LiveView/Filter/HasPropertyType.hpp>
@@ -48,6 +48,7 @@
 #include <imgui_internal.h>
 #include <IconsFontAwesome5.h>
 #include <misc/cpp/imgui_stdlib.h>
+#include <fmt/chrono.h>
 
 namespace RC::GUI
 {
@@ -58,12 +59,9 @@ namespace RC::GUI
                                               Filter::IncludeDefaultObjects,
                                               Filter::DefaultObjectsOnly,
                                               Filter::FunctionParamFlags,
-                                              Filter::ExcludeClassName,
+                                              Filter::ClassNamesFilter,
                                               Filter::HasProperty,
                                               Filter::HasPropertyType>{};
-
-    static int s_max_elements_per_chunk{};
-    static int s_chunk_id_start{};
 
     static bool s_live_view_destructed = false;
     static std::unordered_map<const UObject*, std::string> s_object_ptr_to_full_name{};
@@ -87,6 +85,7 @@ namespace RC::GUI
     bool LiveView::s_selected_item_deleted{};
     bool LiveView::s_need_to_filter_out_properties{};
     bool LiveView::s_watches_loaded_from_disk{};
+    bool LiveView::s_filters_loaded_from_disk{};
     bool LiveView::s_use_regex_for_search{};
 
     static LiveView* s_live_view{};
@@ -108,7 +107,8 @@ namespace RC::GUI
     {
         // TODO: Stop using the 'HashObject' function when needing the address of an FFieldClassVariant because it's not designed to return an address.
         //       Maybe make the ToFieldClass/ToUClass functions public (append 'Unsafe' to the function names).
-        if (LiveView::s_need_to_filter_out_properties && object->IsA(std::bit_cast<UClass*>(FProperty::StaticClass().HashObject())))
+        if (LiveView::s_name_to_search_by.empty() ||
+            LiveView::s_need_to_filter_out_properties && object->IsA(std::bit_cast<UClass*>(FProperty::StaticClass().HashObject())))
         {
             return;
         }
@@ -279,6 +279,216 @@ namespace RC::GUI
     };
     FLiveViewDeleteListener FLiveViewDeleteListener::LiveViewDeleteListener{};
 
+    static auto add_bool_filter_to_json(JSON::Array& json_filters, const StringType& filter_name, bool is_enabled) -> void
+    {
+        auto& json_object = json_filters.new_object();
+        json_object.new_string(STR("FilterName"), filter_name);
+        auto& filter_data = json_object.new_object(STR("FilterData"));
+        filter_data.new_bool(STR("Enabled"), is_enabled);
+    }
+
+    template <typename ContainerType>
+    static auto add_array_filter_to_json(JSON::Array& json_filters, const StringType& filter_name, const ContainerType& container, const StringType& array_name) -> void
+    {
+        auto& json_object = json_filters.new_object();
+        json_object.new_string(STR("FilterName"), filter_name);
+        auto& filter_data = json_object.new_object(STR("FilterData"));
+
+        if (array_name == STR("ClassNames"))
+        {
+            filter_data.new_bool(STR("IsExclude"), Filter::ClassNamesFilter::b_is_exclude);
+        }
+        else if (array_name == STR("FunctionParamFlags"))
+        {
+            filter_data.new_bool(STR("IncludeReturnProperty"), Filter::FunctionParamFlags::s_include_return_property);
+        }
+
+        auto& values_array = filter_data.new_array(array_name);
+        for (const auto& value : container)
+        {
+            if constexpr (std::is_same_v<typename ContainerType::value_type, FName>)
+            {
+                values_array.new_string(value.ToString());
+            }
+            else if constexpr (std::is_same_v<typename ContainerType::value_type, bool>)
+            {
+                values_array.new_bool(value);
+            }
+            else
+            {
+                values_array.new_string(value);
+            }
+        }
+    }
+
+    static auto internal_save_filters_to_disk() -> void
+    {
+        auto json = JSON::Object{};
+        auto& json_filters = json.new_array(STR("Filters"));
+        {
+            add_bool_filter_to_json(json_filters, STR("IncludeInheritance"), LiveView::s_include_inheritance);
+            add_bool_filter_to_json(json_filters, STR("UseRegexForSearch"), LiveView::s_use_regex_for_search);
+            add_bool_filter_to_json(json_filters, STR("ApplySearchFiltersWhenNotSearching"), LiveView::s_apply_search_filters_when_not_searching);
+            add_bool_filter_to_json(json_filters, Filter::DefaultObjectsOnly::s_debug_name, Filter::DefaultObjectsOnly::s_enabled);
+            add_bool_filter_to_json(json_filters, Filter::IncludeDefaultObjects::s_debug_name, Filter::IncludeDefaultObjects::s_enabled);
+            add_bool_filter_to_json(json_filters, Filter::InstancesOnly::s_debug_name, Filter::InstancesOnly::s_enabled);
+            add_bool_filter_to_json(json_filters, Filter::NonInstancesOnly::s_debug_name, Filter::NonInstancesOnly::s_enabled);
+        }
+        {
+            add_array_filter_to_json(json_filters, Filter::ClassNamesFilter::s_debug_name, Filter::ClassNamesFilter::list_class_names, STR("ClassNames"));
+            add_array_filter_to_json(json_filters, Filter::HasProperty::s_debug_name, Filter::HasProperty::list_properties, STR("Properties"));
+            add_array_filter_to_json(json_filters, Filter::HasPropertyType::s_debug_name, Filter::HasPropertyType::list_property_types, STR("PropertyTypes"));
+            add_array_filter_to_json(json_filters, Filter::FunctionParamFlags::s_debug_name, Filter::FunctionParamFlags::s_checkboxes, STR("FunctionParamFlags"));
+        }
+
+        auto json_file =
+                File::open(StringType{UE4SSProgram::get_program().get_working_directory()} + fmt::format(STR("\\liveview\\filters.meta.json")),
+                           File::OpenFor::Writing,
+                           File::OverwriteExistingFile::Yes,
+                           File::CreateIfNonExistent::Yes);
+        int32_t json_indent_level{};
+        json_file.write_string_to_file(json.serialize(JSON::ShouldFormat::Yes, &json_indent_level));
+    }
+
+    static auto save_filters_to_disk() -> void
+    {
+        TRY([] {
+            internal_save_filters_to_disk();
+        });
+    }
+
+    template <typename T>
+    static auto json_array_to_filters_list(JSON::Array& json_array, std::vector<T>& list, StringType type, std::string& internal_value) -> void
+    {
+        list.clear();
+        internal_value.clear();
+        json_array.for_each([&](JSON::Value& item) {
+            if (!item.is<JSON::String>())
+            {
+                throw std::runtime_error{fmt::format("Invalid {} in 'filters.meta.json'", to_string(type))};
+            }
+            list.emplace_back(item.as<JSON::String>()->get_view());
+            return LoopAction::Continue;
+        });
+        for (const auto& class_name : list)
+        {
+            if constexpr (std::is_same_v<T, FName>)
+            {
+                internal_value += to_string(class_name.ToString());
+            }
+            else
+            {
+                internal_value += to_string(class_name);
+            }
+            
+            if (&class_name != &list.back())
+            {
+                internal_value += ", ";
+            }
+        }
+    }
+
+    static auto internal_load_filters_from_disk() -> void
+    {
+        const auto json_file =
+                File::open(StringType{UE4SSProgram::get_program().get_working_directory()} + fmt::format(STR("\\liveview\\filters.meta.json")),
+                           File::OpenFor::Reading,
+                           File::OverwriteExistingFile::No,
+                           File::CreateIfNonExistent::Yes);
+        auto json_file_contents = json_file.read_all();
+        if (json_file_contents.empty())
+        {
+            return;
+        }
+
+        const auto json_global_object = JSON::Parser::parse(json_file_contents);
+        const auto& json_filters = json_global_object->get<JSON::Array>(STR("Filters"));
+        json_filters.for_each([&](const JSON::Value& filter) {
+            if (!filter.is<JSON::Object>())
+            {
+                throw std::runtime_error{"Invalid filter in 'filters.meta.json'"};
+            }
+            auto& json_object = *filter.as<JSON::Object>();
+            auto filter_name = json_object.get<JSON::String>(STR("FilterName")).get_view();
+            auto& filter_data = json_object.get<JSON::Object>(STR("FilterData"));
+
+            if (filter_name == STR("IncludeInheritance"))
+            {
+                LiveView::s_include_inheritance = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == STR("UseRegexForSearch"))
+            {
+                LiveView::s_use_regex_for_search = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == STR("ApplySearchFiltersWhenNotSearching"))
+            {
+                LiveView::s_apply_search_filters_when_not_searching = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == Filter::DefaultObjectsOnly::s_debug_name)
+            {
+                Filter::DefaultObjectsOnly::s_enabled = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == Filter::IncludeDefaultObjects::s_debug_name)
+            {
+                Filter::IncludeDefaultObjects::s_enabled = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == Filter::InstancesOnly::s_debug_name)
+            {
+                Filter::InstancesOnly::s_enabled = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == Filter::NonInstancesOnly::s_debug_name)
+            {
+                Filter::NonInstancesOnly::s_enabled = filter_data.get<JSON::Bool>(STR("Enabled")).get();
+            }
+            else if (filter_name == Filter::ClassNamesFilter::s_debug_name)
+            {
+                Filter::ClassNamesFilter::b_is_exclude = filter_data.get<JSON::Bool>(STR("IsExclude")).get();
+                auto& class_names = filter_data.get<JSON::Array>(STR("ClassNames"));
+                json_array_to_filters_list(class_names, Filter::ClassNamesFilter::list_class_names, STR("class name"), Filter::ClassNamesFilter::s_internal_class_names);
+            }
+            else if (filter_name == Filter::HasProperty::s_debug_name)
+            {
+                auto& properties = filter_data.get<JSON::Array>(STR("Properties"));
+                json_array_to_filters_list(properties, Filter::HasProperty::list_properties, STR("property"), Filter::HasProperty::s_internal_properties);
+            }
+            else if (filter_name == Filter::HasPropertyType::s_debug_name)
+            {
+                auto& property_types = filter_data.get<JSON::Array>(STR("PropertyTypes"));
+                json_array_to_filters_list(property_types,
+                                           Filter::HasPropertyType::list_property_types,
+                                           STR("property type"),
+                                           Filter::HasPropertyType::s_internal_property_types);
+            }
+            else if (filter_name == Filter::FunctionParamFlags::s_debug_name)
+            {
+                Filter::FunctionParamFlags::s_include_return_property = filter_data.get<JSON::Bool>(STR("IncludeReturnProperty")).get();
+                Filter::FunctionParamFlags::s_checkboxes.fill(false);
+                auto& function_param_flags = filter_data.get<JSON::Array>(STR("FunctionParamFlags"));
+                if (function_param_flags.get().size() != Filter::FunctionParamFlags::s_checkboxes.size())
+                {
+                    throw std::runtime_error{"Invalid number of function param flag entires in 'filters.meta.json'"};
+                }
+                function_param_flags.for_each([](auto index, JSON::Value& flag) {
+                    if (!flag.is<JSON::Bool>())
+                    {
+                        throw std::runtime_error{"Invalid flag in 'filters.meta.json'"};
+                    }
+                    Filter::FunctionParamFlags::s_checkboxes[index] = flag.as<JSON::Bool>()->get();
+                    return LoopAction::Continue;
+                });
+            }
+
+            return LoopAction::Continue;
+        });
+    }
+
+    static auto load_filters_from_disk() -> void
+    {
+        TRY([] {
+            internal_load_filters_from_disk();
+        });
+    }
+
     static auto toggle_function_watch(LiveView::Watch& watch, bool new_value) -> void
     {
         watch.enabled = new_value;
@@ -369,11 +579,13 @@ namespace RC::GUI
 
     static auto internal_load_watches_from_disk() -> void
     {
-        auto json_file = File::open(StringType{UE4SSProgram::get_program().get_working_directory()} + std::format(STR("\\watches\\watches.meta.json")),
-                                    File::OpenFor::Reading,
-                                    File::OverwriteExistingFile::No,
-                                    File::CreateIfNonExistent::Yes);
-        auto json_file_contents = json_file.read_all();
+        auto working_directory_path = StringType{UE4SSProgram::get_program().get_working_directory()} + fmt::format(STR("\\watches\\watches.meta.json"));
+        auto legacy_root_directory_path = StringType{UE4SSProgram::get_program().get_legacy_root_directory()} + fmt::format(STR("\\watches\\watches.meta.json"));
+    
+        StringType json_file_contents;
+        bool is_legacy = !std::filesystem::exists(working_directory_path) && std::filesystem::exists(legacy_root_directory_path);
+        auto json_file = File::open(is_legacy ? legacy_root_directory_path : working_directory_path, File::OpenFor::Reading, File::OverwriteExistingFile::No, File::CreateIfNonExistent::Yes);
+        
         if (json_file_contents.empty())
         {
             return;
@@ -382,6 +594,10 @@ namespace RC::GUI
         auto json_global_object = JSON::Parser::parse(json_file_contents);
         const auto& elements = json_global_object->get<JSON::Array>(STR("Watches"));
         elements.for_each([](JSON::Value& element) {
+            if (!element.is<JSON::Object>())
+            {
+                throw std::runtime_error{"Invalid watch in 'watches.meta.json'"};
+            }
             auto& json_watch_object = *element.as<JSON::Object>();
             auto acquisition_id = json_watch_object.get<JSON::String>(STR("AcquisitionID")).get_view();
             auto property_name = json_watch_object.get<JSON::String>(STR("PropertyName")).get_view();
@@ -458,7 +674,7 @@ namespace RC::GUI
             }
         }
 
-        auto json_file = File::open(StringType{UE4SSProgram::get_program().get_working_directory()} + std::format(STR("\\watches\\watches.meta.json")),
+        auto json_file = File::open(StringType{UE4SSProgram::get_program().get_working_directory()} + fmt::format(STR("\\watches\\watches.meta.json")),
                                     File::OpenFor::Writing,
                                     File::OverwriteExistingFile::Yes,
                                     File::CreateIfNonExistent::Yes);
@@ -499,24 +715,16 @@ namespace RC::GUI
     {
         auto& file_device = output.get_device<Output::FileDevice>();
         file_device.set_file_name_and_path(StringType{UE4SSProgram::get_program().get_working_directory()} +
-                                           std::format(STR("\\watches\\ue4ss_watch_{}_{}.txt"), object_name, property_name));
+                                           fmt::format(STR("\\watches\\ue4ss_watch_{}_{}.txt"), object_name, property_name));
         file_device.set_formatter([](File::StringViewType string) -> File::StringType {
-            const auto when_as_string = std::format(STR("{:%Y-%m-%d %H:%M:%S}"), std::chrono::system_clock::now());
-            return std::format(STR("[{}] {}"), when_as_string, string);
+            const auto when_as_string = fmt::format(STR("{:%Y-%m-%d %H:%M:%S}"), std::chrono::system_clock::now());
+            return fmt::format(STR("[{}] {}"), when_as_string, string);
         });
     }
 
     auto LiveView::initialize() -> void
     {
         s_need_to_filter_out_properties = Version::IsBelow(4, 25);
-        if (UE4SSProgram::settings_manager.Debug.LiveViewObjectsPerGroup > std::numeric_limits<int>::max())
-        {
-            Output::send<LogLevel::Warning>(STR("Debug.LiveViewObjectsPerGroup is too large, must be no larger than 4294967295.\n"));
-            Output::send<LogLevel::Warning>(STR("Using default value for Debug.LiveViewObjectsPerGroup.\n"));
-            UE4SSProgram::settings_manager.Debug.LiveViewObjectsPerGroup = 64 * 1024 / 2;
-        }
-        s_max_elements_per_chunk = static_cast<int>(UE4SSProgram::settings_manager.Debug.LiveViewObjectsPerGroup);
-        s_chunk_id_start = -s_max_elements_per_chunk;
         m_is_initialized = true;
     }
 
@@ -1307,13 +1515,18 @@ namespace RC::GUI
         }
     }
 
-    auto LiveView::guobjectarray_by_name_iterator([[maybe_unused]] int32_t int_data_1,
-                                                  [[maybe_unused]] int32_t int_data_2,
-                                                  const std::function<void(UObject*)>& callable) -> void
+    auto LiveView::guobjectarray_by_name_iterator(int32_t int_data_1, int32_t int_data_2, const std::function<void(UObject*)>& callable) -> void
     {
-        for (const auto& object : s_name_search_results)
+        if (int_data_2 > s_name_search_results.size())
         {
-            callable(object);
+            Output::send<LogLevel::Error>(STR("guobjectarray_by_name_iterator: asked to iterate beyond the size of the search result vector ({} > {})\n"),
+                                          int_data_2,
+                                          s_name_search_results.size());
+            return;
+        }
+        for (size_t i = int_data_1; i < int_data_2; i++)
+        {
+            callable(s_name_search_results[i]);
         }
     }
 
@@ -1326,18 +1539,6 @@ namespace RC::GUI
             attempt_to_add_search_result(object);
             return LoopAction::Continue;
         });
-    }
-
-    static auto collapse_all_except(int except_id) -> void
-    {
-        for (int i = 0; i < UObjectArray::GetNumChunks(); ++i)
-        {
-            if (i + s_chunk_id_start == except_id)
-            {
-                continue;
-            }
-            ImGui::GetStateStorage()->SetInt(ImGui_GetID(i + s_chunk_id_start), 0);
-        }
     }
 
     auto LiveView::collapse_all_except(void* except_id) -> void
@@ -1358,6 +1559,29 @@ namespace RC::GUI
             else
             {
                 ++tree_node;
+            }
+        }
+    }
+
+    auto LiveView::search() -> void
+    {
+        if (are_listeners_allowed())
+        {
+            std::string search_buffer{m_search_by_name_buffer};
+            if (search_buffer.empty() || s_apply_search_filters_when_not_searching)
+            {
+                Output::send(STR("Search all chunks\n"));
+                s_name_to_search_by.clear();
+                m_object_iterator = &LiveView::guobjectarray_iterator;
+                m_is_searching_by_name = false;
+            }
+            else
+            {
+                Output::send(STR("Search for: {}\n"), search_buffer.empty() ? STR("") : to_wstring(search_buffer));
+                s_name_to_search_by = search_buffer;
+                m_object_iterator = &LiveView::guobjectarray_by_name_iterator;
+                m_is_searching_by_name = true;
+                search_by_name();
             }
         }
     }
@@ -1559,7 +1783,7 @@ namespace RC::GUI
         bool open_edit_value_popup{};
 
         auto render_property_value_context_menu = [&](std::string_view id_override = "") {
-            if (ImGui::BeginPopupContextItem(id_override.empty() ? property_name.c_str() : std::format("context-menu-{}", id_override).c_str()))
+            if (ImGui::BeginPopupContextItem(id_override.empty() ? property_name.c_str() : fmt::format("context-menu-{}", id_override).c_str()))
             {
                 if (ImGui::MenuItem("Copy name"))
                 {
@@ -1639,14 +1863,14 @@ namespace RC::GUI
         {
             ImGui::Text("0x%X%s %s:",
                         first_offset,
-                        container_type == ContainerType::Array ? std::format("").c_str() : std::format(" (0x{:X})", property_offset).c_str(),
+                        container_type == ContainerType::Array ? fmt::format("").c_str() : fmt::format(" (0x{:X})", property_offset).c_str(),
                         property_name.c_str());
         }
         if (auto struct_property = CastField<FStructProperty>(property); struct_property && struct_property->GetStruct()->GetFirstProperty())
         {
             ImGui::SameLine();
-            auto tree_node_id = std::format("{}{}", static_cast<void*>(container_ptr), property_name);
-            if (ImGui_TreeNodeEx(std::format("{}", to_string(property_text.GetCharArray())).c_str(), tree_node_id.c_str(), ImGuiTreeNodeFlags_NoAutoOpenOnLog))
+            auto tree_node_id = fmt::format("{}{}", static_cast<void*>(container_ptr), property_name);
+            if (ImGui_TreeNodeEx(fmt::format("{}", to_string(property_text.GetCharArray())).c_str(), tree_node_id.c_str(), ImGuiTreeNodeFlags_NoAutoOpenOnLog))
             {
                 render_property_value_context_menu(tree_node_id);
 
@@ -1679,8 +1903,8 @@ namespace RC::GUI
         else if (auto array_property = CastField<FArrayProperty>(property); array_property)
         {
             ImGui::SameLine();
-            auto tree_node_id = std::format("{}{}", static_cast<void*>(container_ptr), property_name);
-            if (ImGui_TreeNodeEx(std::format("{}", to_string(property_text.GetCharArray())).c_str(), tree_node_id.c_str(), ImGuiTreeNodeFlags_NoAutoOpenOnLog))
+            auto tree_node_id = fmt::format("{}{}", static_cast<void*>(container_ptr), property_name);
+            if (ImGui_TreeNodeEx(fmt::format("{}", to_string(property_text.GetCharArray())).c_str(), tree_node_id.c_str(), ImGuiTreeNodeFlags_NoAutoOpenOnLog))
             {
                 render_property_value_context_menu(tree_node_id);
 
@@ -1764,7 +1988,7 @@ namespace RC::GUI
         {
             parent_name = obj ? obj->GetName() : STR("None");
         }
-        auto edit_property_value_modal_name = to_string(std::format(STR("Edit value of property: {}->{}"), parent_name, property->GetName()));
+        auto edit_property_value_modal_name = to_string(fmt::format(STR("Edit value of property: {}->{}"), parent_name, property->GetName()));
 
         if (open_edit_value_popup)
         {
@@ -1854,7 +2078,7 @@ namespace RC::GUI
 
             ImGui::TableNextColumn();
             ImGui::Text("%S", enum_name.c_str());
-            if (ImGui::BeginPopupContextItem(to_string(std::format(STR("context-menu-{}"), enum_name)).c_str()))
+            if (ImGui::BeginPopupContextItem(to_string(fmt::format(STR("context-menu-{}"), enum_name)).c_str()))
             {
                 if (ImGui::MenuItem("Copy name"))
                 {
@@ -1873,7 +2097,7 @@ namespace RC::GUI
 
             ImGui::TableNextColumn();
             ImGui::Text("%lld", name.Value);
-            if (ImGui::BeginPopupContextItem(to_string(std::format(STR("context-menu-{}-{}"), enum_name, name.Value)).c_str()))
+            if (ImGui::BeginPopupContextItem(to_string(fmt::format(STR("context-menu-{}-{}"), enum_name, name.Value)).c_str()))
             {
                 if (ImGui::MenuItem("Copy value"))
                 {
@@ -1888,7 +2112,7 @@ namespace RC::GUI
             }
 
             ImGui::TableNextColumn();
-            ImGui::PushID(to_string(std::format(STR("button_add_{}"), enum_name)).c_str());
+            ImGui::PushID(to_string(fmt::format(STR("button_add_{}"), enum_name)).c_str());
             if (ImGui::Button("+"))
             {
                 open_add_name_popup = true;
@@ -1896,18 +2120,18 @@ namespace RC::GUI
             }
             ImGui::PopID();
             ImGui::SameLine();
-            ImGui::PushID(to_string(std::format(STR("button_remove_{}"), enum_name)).c_str());
+            ImGui::PushID(to_string(fmt::format(STR("button_remove_{}"), enum_name)).c_str());
             if (ImGui::Button("-"))
             {
                 uenum->RemoveFromNamesAt(index, 1);
             }
             ImGui::PopID();
 
-            std::string edit_enum_name_modal_name = to_string(std::format(STR("Edit enum name for: {}"), name.Key.ToString()));
+            std::string edit_enum_name_modal_name = to_string(fmt::format(STR("Edit enum name for: {}"), name.Key.ToString()));
 
-            std::string edit_enum_value_modal_name = to_string(std::format(STR("Edit enum value for: {}"), name.Key.ToString()));
+            std::string edit_enum_value_modal_name = to_string(fmt::format(STR("Edit enum value for: {}"), name.Key.ToString()));
 
-            std::string add_enum_name_modal_name = to_string(std::format(STR("Enter new enum name after: {}"), name.Key.ToString()));
+            std::string add_enum_name_modal_name = to_string(fmt::format(STR("Enter new enum name after: {}"), name.Key.ToString()));
 
             if (open_edit_name_popup)
             {
@@ -2242,7 +2466,7 @@ namespace RC::GUI
         {
             if (ImGui::MenuItem("Copy raw flags"))
             {
-                ImGui::SetClipboardText(std::format("0x{:X}", static_cast<uint32_t>(raw_unsafe_object_flags)).c_str());
+                ImGui::SetClipboardText(fmt::format("0x{:X}", static_cast<uint32_t>(raw_unsafe_object_flags)).c_str());
             }
             ImGui::EndPopup();
         }
@@ -2251,7 +2475,7 @@ namespace RC::GUI
         std::string current_flag_line{};
         std::string all_flags{};
         auto create_menu_for_copy_flags = [&](size_t menu_index) {
-            if (ImGui::BeginPopupContextItem(std::format("{}_{}", Stringifier::popup_context_item_id, menu_index).c_str()))
+            if (ImGui::BeginPopupContextItem(fmt::format("{}_{}", Stringifier::popup_context_item_id, menu_index).c_str()))
             {
                 if (ImGui::MenuItem("Copy flags"))
                 {
@@ -2310,7 +2534,7 @@ namespace RC::GUI
         {
             if (ImGui::MenuItem("Copy address"))
             {
-                ImGui::SetClipboardText(std::format("{:016X}", std::bit_cast<uintptr_t>(object)).c_str());
+                ImGui::SetClipboardText(fmt::format("{:016X}", std::bit_cast<uintptr_t>(object)).c_str());
             }
             ImGui::EndPopup();
         }
@@ -2395,7 +2619,7 @@ namespace RC::GUI
         {
             if (ImGui::MenuItem("Copy address"))
             {
-                ImGui::SetClipboardText(std::format("{:016X}", std::bit_cast<uintptr_t>(property)).c_str());
+                ImGui::SetClipboardText(fmt::format("{:016X}", std::bit_cast<uintptr_t>(property)).c_str());
             }
             ImGui::EndPopup();
         }
@@ -2412,7 +2636,7 @@ namespace RC::GUI
         {
             if (ImGui::MenuItem("Copy raw flags"))
             {
-                ImGui::SetClipboardText(std::format("0x{:X}", static_cast<uint64_t>(property_flags)).c_str());
+                ImGui::SetClipboardText(fmt::format("0x{:X}", static_cast<uint64_t>(property_flags)).c_str());
             }
             ImGui::EndPopup();
         }
@@ -2421,7 +2645,7 @@ namespace RC::GUI
         std::string current_flag_line{};
         std::string all_flags{};
         auto create_menu_for_copy_flags = [&](size_t menu_index) {
-            if (ImGui::BeginPopupContextItem(std::format("property_flags_menu_{}", menu_index).c_str()))
+            if (ImGui::BeginPopupContextItem(fmt::format("property_flags_menu_{}", menu_index).c_str()))
             {
                 if (ImGui::MenuItem("Copy flags"))
                 {
@@ -2478,7 +2702,7 @@ namespace RC::GUI
         };
         int go_to_property_menu_count{};
         auto create_go_to_property_menu = [&](FProperty* goto_to_property) {
-            if (ImGui::BeginPopupContextItem(std::format("property_link_next_menu_{}", go_to_property_menu_count++).c_str()))
+            if (ImGui::BeginPopupContextItem(fmt::format("property_link_next_menu_{}", go_to_property_menu_count++).c_str()))
             {
                 if (ImGui::MenuItem("Go to property"))
                 {
@@ -2562,7 +2786,7 @@ namespace RC::GUI
                 }
                 else
                 {
-                    if (ImGui::MenuItem(std::format("{}. {}", item_index, item.GetFullName()).c_str()))
+                    if (ImGui::MenuItem(fmt::format("{}. {}", item_index, item.GetFullName()).c_str()))
                     {
                         next_item_index = item_index;
                         selected_an_item = true;
@@ -2654,6 +2878,13 @@ namespace RC::GUI
     static auto object_search_field_always_callback(ImGuiInputTextCallbackData* data) -> int
     {
         auto typed_this = static_cast<LiveView*>(data->UserData);
+        if (LiveView::s_apply_search_filters_when_not_searching)
+        {
+            static constexpr auto message = std::string_view{"Searching is disabled while 'Apply filters when not searching' is enabled.'"};
+            strncpy_s(data->Buf, message.size() + 1, message.data(), message.size() + 1);
+            data->BufTextLen = message.size();
+            data->BufDirty = true;
+        }
         if (typed_this->was_search_field_clear_requested() && !typed_this->was_search_field_cleared())
         {
             strncpy_s(data->Buf, 1, "", 1);
@@ -2677,7 +2908,7 @@ namespace RC::GUI
 
         watch.property_value = std::move(live_value_string);
 
-        const auto when_as_string = std::format(STR("{:%H:%M:%S}"), std::chrono::system_clock::now());
+        const auto when_as_string = fmt::format(STR("{:%H:%M:%S}"), std::chrono::system_clock::now());
         watch.history.append(to_string(when_as_string + STR(" ") + watch.property_value + STR("\n")));
 
         if (watch.write_to_file)
@@ -2713,10 +2944,10 @@ namespace RC::GUI
 
         auto num_params = function->GetNumParms();
 
-        const auto when_as_string = std::format(STR("{:%H:%M:%S}"), std::chrono::system_clock::now());
-        StringType buffer{std::format(STR("Received call @ {}.\n"), when_as_string)};
+        const auto when_as_string = fmt::format(STR("{:%H:%M:%S}"), std::chrono::system_clock::now());
+        StringType buffer{fmt::format(STR("Received call @ {}.\n"), when_as_string)};
 
-        buffer.append(std::format(STR("  Context:\n    {}\n"), context.Context->GetFullName()));
+        buffer.append(fmt::format(STR("  Context:\n    {}\n"), context.Context->GetFullName()));
 
         buffer.append(STR("  Locals:\n"));
         bool has_local_params{};
@@ -2730,7 +2961,7 @@ namespace RC::GUI
             FString param_text{};
             auto container_ptr = param->ContainerPtrToValuePtr<void*>(context.TheStack.Locals());
             param->ExportTextItem(param_text, container_ptr, container_ptr, std::bit_cast<UObject*>(function), NULL);
-            buffer.append(std::format(STR("    {} = {}\n"), param->GetName(), param_text.GetCharArray()));
+            buffer.append(fmt::format(STR("    {} = {}\n"), param->GetName(), param_text.GetCharArray()));
         }
         if (!has_local_params)
         {
@@ -2753,7 +2984,7 @@ namespace RC::GUI
             FString param_text{};
             auto container_ptr = FindOutParamValueAddress(context.TheStack, param);
             param->ExportTextItem(param_text, container_ptr, container_ptr, std::bit_cast<UObject*>(function), NULL);
-            buffer.append(std::format(STR("    {} = {}\n"), param->GetName(), param_text.GetCharArray()));
+            buffer.append(fmt::format(STR("    {} = {}\n"), param->GetName(), param_text.GetCharArray()));
         }
         if (!has_out_params)
         {
@@ -2767,7 +2998,7 @@ namespace RC::GUI
             FString return_property_text{};
             auto container_ptr = context.RESULT_DECL;
             return_property->ExportTextItem(return_property_text, container_ptr, container_ptr, std::bit_cast<UObject*>(function), NULL);
-            buffer.append(std::format(STR("    {}"), return_property_text.GetCharArray()));
+            buffer.append(fmt::format(STR("    {}"), return_property_text.GetCharArray()));
         }
         else
         {
@@ -2827,6 +3058,12 @@ namespace RC::GUI
             s_watches_loaded_from_disk = true;
         }
 
+        if (!s_filters_loaded_from_disk)
+        {
+            load_filters_from_disk();
+            s_filters_loaded_from_disk = true;
+        }
+
         bool listeners_allowed = are_listeners_allowed();
         if (!listeners_allowed)
         {
@@ -2840,6 +3077,7 @@ namespace RC::GUI
         {
             ImGui::PushStyleColor(ImGuiCol_Text, g_imgui_text_inactive_color.Value);
         }
+        auto apply_search_filters_when_not_searching = s_apply_search_filters_when_not_searching;
         if (ImGui::InputText("##Search by name",
                              m_search_by_name_buffer,
                              m_search_buffer_capacity,
@@ -2847,30 +3085,23 @@ namespace RC::GUI
                              &object_search_field_always_callback,
                              this))
         {
-            if (listeners_allowed)
+            if (!apply_search_filters_when_not_searching)
             {
-                std::string search_buffer{m_search_by_name_buffer};
-                if (search_buffer.empty())
-                {
-                    Output::send(STR("Search all chunks\n"));
-                    s_name_to_search_by.clear();
-                    m_object_iterator = &LiveView::guobjectarray_iterator;
-                    m_is_searching_by_name = false;
-                }
-                else
-                {
-                    Output::send(STR("Search for: {}\n"), search_buffer.empty() ? STR("") : to_wstring(search_buffer));
-                    s_name_to_search_by = search_buffer;
-                    m_object_iterator = &LiveView::guobjectarray_by_name_iterator;
-                    m_is_searching_by_name = true;
-                    search_by_name();
-                }
+                search();
             }
         }
-        if (ImGui::IsItemHovered())
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         {
             ImGui::BeginTooltip();
-            ImGui::Text("Right-click to open search options.");
+            if (!apply_search_filters_when_not_searching)
+            {
+                ImGui::Text("Right-click to open search options.");
+            }
+            else
+            {
+                ImGui::Text("You can't search with 'Apply filters when not searching' enabled.");
+                ImGui::Text("Right click to bring up the menu and disable this option.");
+            }
             ImGui::EndTooltip();
         }
         if (push_inactive_text_color)
@@ -2883,14 +3114,25 @@ namespace RC::GUI
         {
             ImGui::Text("Search options");
             ImGui::SameLine();
-            ImGui::Checkbox("Apply when not searching", &s_apply_search_filters_when_not_searching);
+            // Making sure the user can't enable filters when not searching, if they are currently actually searching.
+            // Otherwise it uses the wrong iterator.
+            auto is_searching_by_name = m_is_searching_by_name;
+            if (is_searching_by_name)
+            {
+                ImGui::BeginDisabled();
+            }
+            ImGui::Checkbox("Apply filters when not searching", &s_apply_search_filters_when_not_searching);
+            if (is_searching_by_name)
+            {
+                ImGui::EndDisabled();
+            }
             if (ImGui::BeginTable("search_options_table", 2))
             {
                 bool instances_only_enabled = !(Filter::NonInstancesOnly::s_enabled || Filter::DefaultObjectsOnly::s_enabled);
                 bool non_instances_only_enabled = !(Filter::InstancesOnly::s_enabled || Filter::DefaultObjectsOnly::s_enabled);
                 bool default_objects_only_enabled = !(Filter::NonInstancesOnly::s_enabled || Filter::InstancesOnly::s_enabled);
 
-                //  Row #1
+                //  Row 1
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::Checkbox("Include inheritance", &s_include_inheritance);
@@ -2905,17 +3147,10 @@ namespace RC::GUI
                     ImGui::EndDisabled();
                 }
 
-                // Row #2
+                // Row 2
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::Checkbox("Function parameter flags", &Filter::FunctionParamFlags::s_enabled);
-                if (ImGui::IsItemHovered())
-                {
-                    ImGui::BeginTooltip();
-                    ImGui::Text("You must manually refresh the search after selecting flags.");
-                    ImGui::Text("Manually refreshing the search can be done by clicking the search bar and hitting enter.");
-                    ImGui::EndTooltip();
-                }
                 ImGui::TableNextColumn();
                 if (!non_instances_only_enabled)
                 {
@@ -2927,7 +3162,7 @@ namespace RC::GUI
                     ImGui::EndDisabled();
                 }
 
-                // Row #3
+                // Row 3
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::Checkbox("Include CDOs", &Filter::IncludeDefaultObjects::s_enabled);
@@ -2950,11 +3185,42 @@ namespace RC::GUI
                 // Row 5
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::Text("Exclude class name");
-                ImGui::TableNextColumn();
-                if (ImGui::InputText("##ExcludeClassName", &Filter::ExcludeClassName::s_internal_value))
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                const char* filter_modes[] = {"Exclude class names", "Include class names"};
+                int current_filter_mode = Filter::ClassNamesFilter::b_is_exclude ? 0 : 1;
+                if (ImGui::Combo("##FilterMode", &current_filter_mode, filter_modes, IM_ARRAYSIZE(filter_modes)))
                 {
-                    Filter::ExcludeClassName::s_value = to_wstring(Filter::ExcludeClassName::s_internal_value);
+                    Filter::ClassNamesFilter::b_is_exclude = current_filter_mode == 0;
+
+                    // Since the filter mode changed, reparse the class names list, reparse s_internal_class_names into list_class_names using new filter mode
+                    Filter::ClassNamesFilter::list_class_names.clear();
+                    if (!Filter::ClassNamesFilter::s_internal_class_names.empty())
+                    {
+                        std::istringstream ss(Filter::ClassNamesFilter::s_internal_class_names);
+                        std::string class_name;
+                        while (std::getline(ss, class_name, ','))
+                        {
+                            std::erase_if(class_name, isspace);
+                            Filter::ClassNamesFilter::list_class_names.emplace_back(to_wstring(class_name));
+                        }
+                    }
+                }
+
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                if (ImGui::InputText("##ClassNamesFilter", &Filter::ClassNamesFilter::s_internal_class_names))
+                {
+                    Filter::ClassNamesFilter::list_class_names.clear();
+                    if (!Filter::ClassNamesFilter::s_internal_class_names.empty())
+                    {
+                        std::istringstream ss(Filter::ClassNamesFilter::s_internal_class_names);
+                        std::string class_name;
+                        while (std::getline(ss, class_name, ','))
+                        {
+                            std::erase_if(class_name, isspace);
+                            Filter::ClassNamesFilter::list_class_names.emplace_back(to_wstring(class_name));
+                        }
+                    }
                 }
 
                 // Row 6
@@ -2962,9 +3228,20 @@ namespace RC::GUI
                 ImGui::TableNextColumn();
                 ImGui::Text("Has property");
                 ImGui::TableNextColumn();
-                if (ImGui::InputText("##HasProperty", &Filter::HasProperty::s_internal_value))
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                if (ImGui::InputText("##HasProperty", &Filter::HasProperty::s_internal_properties))
                 {
-                    Filter::HasProperty::s_value = to_wstring(Filter::HasProperty::s_internal_value);
+                    Filter::HasProperty::list_properties.clear();
+                    if (!Filter::HasProperty::s_internal_properties.empty())
+                    {
+                        std::istringstream ss(Filter::HasProperty::s_internal_properties);
+                        std::string property_name;
+                        while (std::getline(ss, property_name, ','))
+                        {
+                            std::erase_if(property_name, isspace);
+                            Filter::HasProperty::list_properties.emplace_back(to_wstring(property_name));
+                        }
+                    }
                 }
 
                 // Row 7
@@ -2972,9 +3249,41 @@ namespace RC::GUI
                 ImGui::TableNextColumn();
                 ImGui::Text("Has property of type");
                 ImGui::TableNextColumn();
-                if (ImGui::InputText("##HasPropertyType", &Filter::HasPropertyType::s_internal_value))
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                if (ImGui::InputText("##HasPropertyType", &Filter::HasPropertyType::s_internal_property_types))
                 {
-                    Filter::HasPropertyType::s_value = FName(to_wstring(Filter::HasPropertyType::s_internal_value), FNAME_Add);
+                    Filter::HasPropertyType::list_property_types.clear();
+                    if (!Filter::HasPropertyType::s_internal_property_types.empty())
+                    {
+                        std::istringstream ss(Filter::HasPropertyType::s_internal_property_types);
+                        std::string property_type_name;
+                        while (std::getline(ss, property_type_name, ','))
+                        {
+                            std::erase_if(property_type_name, isspace);
+                            if (!property_type_name.empty())
+                            {
+                                Filter::HasPropertyType::list_property_types.emplace_back(FName(to_wstring(property_type_name), FNAME_Add));
+                            }
+                        }
+                    }
+                }
+
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                if (ImGui::Button(ICON_FA_SEARCH " Refresh search"))
+                {
+                    search();
+                }
+                ImGui::TableNextColumn();
+                if (ImGui::Button(ICON_FA_SAVE " Save filters"))
+                {
+                    save_filters_to_disk();
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Saves your filters to <UE4SS.dll install location>/liveview/filters.meta.json");
+                    ImGui::EndTooltip();
                 }
 
                 ImGui::EndTable();
@@ -3195,32 +3504,18 @@ namespace RC::GUI
         };
 
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0.0f, 0.0f});
-        if (m_is_searching_by_name)
+        if (!s_apply_search_filters_when_not_searching)
         {
-            do_iteration();
+            ImGuiListClipper clipper{};
+            clipper.Begin(m_is_searching_by_name ? s_name_search_results.size() : UObjectArray::GetNumElements(), ImGui::GetTextLineHeightWithSpacing());
+            while (clipper.Step())
+            {
+                do_iteration(clipper.DisplayStart, clipper.DisplayEnd);
+            }
         }
         else
         {
-            auto num_elements = UObjectArray::GetNumElements();
-
-            if (!s_apply_search_filters_when_not_searching)
-            {
-                int num_total_chunks = (num_elements / s_max_elements_per_chunk) + (num_elements % s_max_elements_per_chunk == 0 ? 0 : 1);
-                for (int i = 0; i < num_total_chunks; ++i)
-                {
-                    if (ImGui_TreeNodeEx(std::format("Group #{}", i).c_str(), i + s_chunk_id_start, ImGuiTreeNodeFlags_CollapsingHeader))
-                    {
-                        ::RC::GUI::collapse_all_except(i + s_chunk_id_start);
-                        auto start = s_max_elements_per_chunk * i;
-                        auto end = start + s_max_elements_per_chunk;
-                        do_iteration(start, end);
-                    }
-                }
-            }
-            else
-            {
-                do_iteration(0, UObjectArray::GetNumElements());
-            }
+            do_iteration(0, UObjectArray::GetNumElements());
         }
         ImGui::PopStyleVar();
 
@@ -3290,7 +3585,7 @@ namespace RC::GUI
                     auto& watch = *watch_ptr;
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
-                    if (ImGui::Checkbox(to_string(std::format(STR("##watch-on-off-{}"), watch.hash)).c_str(), &watch.enabled))
+                    if (ImGui::Checkbox(to_string(fmt::format(STR("##watch-on-off-{}"), watch.hash)).c_str(), &watch.enabled))
                     {
                         if (watch.container->IsA<UFunction>())
                         {
@@ -3304,7 +3599,7 @@ namespace RC::GUI
                         ImGui::EndTooltip();
                     }
                     ImGui::SameLine(0.0f, 2.0f);
-                    ImGui::Checkbox(to_string(std::format(STR("##watch-write-to-file-{}"), watch.hash)).c_str(), &watch.write_to_file);
+                    ImGui::Checkbox(to_string(fmt::format(STR("##watch-write-to-file-{}"), watch.hash)).c_str(), &watch.write_to_file);
                     if (ImGui::IsItemHovered())
                     {
                         ImGui::BeginTooltip();
@@ -3313,7 +3608,7 @@ namespace RC::GUI
                     }
                     ImGui::SameLine(0.0f, 2.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5f, 0.5f));
-                    ImGui::PushID(std::format("collapse_history_{}", watch.hash).c_str());
+                    ImGui::PushID(fmt::format("collapse_history_{}", watch.hash).c_str());
                     ImGui::Selectable(watch.show_history ? ICON_FA_MINUS : ICON_FA_PLUS, &watch.show_history, ImGuiSelectableFlags_NoPadWithHalfSpacing);
                     ImGui::PopID();
                     ImGui::PopStyleVar();
@@ -3322,18 +3617,21 @@ namespace RC::GUI
                     ImGui::Text("%S.%S", watch.object_name.c_str(), watch.property_name.c_str());
                     if (watch.show_history)
                     {
-                        ImGui::PushID(std::format("history_{}", watch.hash).c_str());
-                        ImGui::InputTextMultiline("##history", &watch.history, {-2.0f, ImGui::GetTextLineHeight() * 10.0f + ImGui::GetStyle().FramePadding.y * 2.0f}, ImGuiInputTextFlags_ReadOnly);
+                        ImGui::PushID(fmt::format("history_{}", watch.hash).c_str());
+                        ImGui::InputTextMultiline("##history",
+                                                  &watch.history,
+                                                  {-2.0f, ImGui::GetTextLineHeight() * 10.0f + ImGui::GetStyle().FramePadding.y * 2.0f},
+                                                  ImGuiInputTextFlags_ReadOnly);
                         ImGui_AutoScroll("##history", &watch.history_previous_max_scroll_y);
                         ImGui::PopID();
                     }
                     ImGui::TableNextColumn();
-                    if (ImGui::Checkbox(to_string(std::format(STR("##watch-from-disk-{}"), watch.hash)).c_str(), &watch.load_on_startup))
+                    if (ImGui::Checkbox(to_string(fmt::format(STR("##watch-from-disk-{}"), watch.hash)).c_str(), &watch.load_on_startup))
                     {
                         save_watches_to_disk();
                     }
                     ImGui::SetNextWindowSize({690.0f, 0.0f});
-                    if (ImGui::BeginPopupContextItem(to_string(std::format(STR("##watch-from-disk-settings-popup-{}"), watch.hash)).c_str()))
+                    if (ImGui::BeginPopupContextItem(to_string(fmt::format(STR("##watch-from-disk-settings-popup-{}"), watch.hash)).c_str()))
                     {
                         ImGui::Text("Acquisition Method");
                         ImGui::Text("This determines how the watch will be reacquired.");
